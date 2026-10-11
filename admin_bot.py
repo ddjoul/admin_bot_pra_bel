@@ -3,6 +3,13 @@ import hashlib
 import json
 import logging
 import os
+import secrets
+import signal
+from urllib.parse import urlparse
+
+from aiohttp import web
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -136,7 +143,11 @@ async def callback(c: CallbackQuery):
     if c.from_user.id != ADMIN or not c.message or c.message.chat.type != 'private':
         await c.answer('нет доступа', show_alert=True)
         return
-    await c.answer()
+    try:
+        await c.answer()
+    except TelegramBadRequest as exc:
+        if 'query is too old' not in str(exc).lower() and 'query id is invalid' not in str(exc).lower():
+            raise
     async with lock:
         parts = c.data.split(':')
         if len(parts)==3 and parts[0]=='q' and parts[1] in ('c','p'):
@@ -199,16 +210,123 @@ async def errors(event):
             pass
     return True
 
-async def main():
-    logging.basicConfig(level=logging.WARNING)
-    for kind, name in [('c','comment_statuses'),('p','post_statuses')]:
-        rows=await query(lambda: db.table(name).select('id,code'))
-        statuses[kind]={x['code']:x['id'] for x in rows}
-        needed={waiting(kind),'published','rejected'}
-        if not needed.issubset(statuses[kind]):
-            raise RuntimeError(f'В {name} отсутствуют статусы {needed-set(statuses[kind])}. Выполни setup_admin.sql')
-    await bot.delete_webhook(drop_pending_updates=False)
-    await dp.start_polling(bot,handle_as_tasks=False,allowed_updates=['message','callback_query'])
+async def load_statuses():
+    loaded = {}
+    for kind, name in [('c', 'comment_statuses'), ('p', 'post_statuses')]:
+        rows = await query(lambda name=name: db.table(name).select('id,code'))
+        loaded[kind] = {x['code']: x['id'] for x in rows}
+        needed = {waiting(kind), 'published', 'rejected'}
+        if not needed.issubset(loaded[kind]):
+            raise RuntimeError(
+                f'В {name} отсутствуют статусы {needed - set(loaded[kind])}. '
+                'Выполни setup_admin.sql'
+            )
+    statuses.update(loaded)
 
-if __name__=='__main__':
+
+async def startup_retry(operation, label):
+    for attempt in range(1, 9):
+        try:
+            return await operation()
+        except (RuntimeError, TelegramBadRequest):
+            raise
+        except Exception as exc:
+            logging.warning('%s: %s; attempt %s/8', label, type(exc).__name__, attempt)
+            if attempt == 8:
+                raise
+            await asyncio.sleep(min(2 ** (attempt - 1), 20))
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    mode = os.getenv('BOT_MODE', 'auto').strip().lower()
+    base_url = (
+        os.getenv('WEBHOOK_BASE_URL', '').strip()
+        or os.getenv('RENDER_EXTERNAL_URL', '').strip()
+    ).rstrip('/')
+    if mode not in {'auto', 'webhook', 'polling'}:
+        raise RuntimeError('BOT_MODE: auto, webhook или polling')
+    use_webhook = mode == 'webhook' or (mode == 'auto' and bool(base_url))
+    if use_webhook:
+        parsed = urlparse(base_url)
+        if parsed.scheme != 'https' or not parsed.netloc or parsed.query or parsed.fragment:
+            raise RuntimeError('Укажи WEBHOOK_BASE_URL=https://имя-сервиса.onrender.com')
+
+    state = {'ready': False}
+    webhook_path = '/telegram/webhook'
+    secret = os.getenv('WEBHOOK_SECRET', '').strip() or secrets.token_urlsafe(32)
+
+    @web.middleware
+    async def readiness(request, handler):
+        if request.path == webhook_path and not state['ready']:
+            return web.Response(status=503, text='Starting')
+        return await handler(request)
+
+    async def health(request):
+        return web.json_response({'service': 'admin_bot', 'ready': state['ready']})
+
+    async def ready(request):
+        return web.json_response(
+            {'ready': state['ready']}, status=200 if state['ready'] else 503
+        )
+
+    app = web.Application(middlewares=[readiness])
+    app.router.add_get('/', health)
+    app.router.add_get('/health', health)
+    app.router.add_get('/ready', ready)
+    if use_webhook:
+        SimpleRequestHandler(
+            dispatcher=dp, bot=bot, secret_token=secret,
+            handle_in_background=False
+        ).register(app, path=webhook_path)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed_signals = []
+    try:
+        site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', '10000')))
+        await site.start()
+        logging.info('HTTP server started')
+        await startup_retry(load_statuses, 'Loading statuses')
+        if use_webhook:
+            async def configure_webhook():
+                await bot.set_webhook(
+                    url=base_url + webhook_path,
+                    secret_token=secret,
+                    allowed_updates=['message', 'callback_query'],
+                    drop_pending_updates=False,
+                    max_connections=1
+                )
+            await startup_retry(configure_webhook, 'Setting webhook')
+            state['ready'] = True
+            logging.info('Webhook mode started')
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                    installed_signals.append(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
+            await stop.wait()
+        else:
+            async def remove_webhook():
+                await bot.delete_webhook(drop_pending_updates=False)
+            await startup_retry(remove_webhook, 'Removing webhook')
+            state['ready'] = True
+            logging.info('Polling mode started')
+            await dp.start_polling(
+                bot, handle_as_tasks=False,
+                allowed_updates=['message', 'callback_query']
+            )
+    finally:
+        state['ready'] = False
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
+        # Keep webhook configured so Telegram can wake the service after sleep.
+        await runner.cleanup()
+        await bot.session.close()
+
+
+if __name__ == '__main__':
     asyncio.run(main())
